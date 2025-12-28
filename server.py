@@ -70,23 +70,59 @@ def get_chain_state(chain_id: str, phases: list) -> dict:
 
 
 def send_to_tmux(text: str) -> bool:
-    """Queue text for injection into tmux via file-based handoff.
-
-    Writes prompt to /tmp/chain-prompt-queue.txt which is picked up by
-    chain-watcher.sh running in yaniv's session. This avoids sudo/PTY
-    issues when running from MCP's stdio transport.
-
-    The watcher script monitors the queue file and injects content into
-    the tmux session, preserving the weight of prompts from yaniv's voice.
-    """
-    prompt_file = Path("/tmp/chain-prompt-queue.txt")
+    """Send text to tmux session using load-buffer for multi-line text."""
+    import time
+    import tempfile
     try:
-        prompt_file.write_text(text)
-        os.chmod(prompt_file, 0o644)
+        # Write text to temp file, then use tmux load-buffer + paste-buffer
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(text)
+            temp_path = f.name
+
+        # Make readable by yaniv
+        os.chmod(temp_path, 0o644)
+
+        # Use start_new_session=True to detach from MCP's stdio
+        # This prevents blocking on PTY allocation
+        subprocess.run(
+            ["sudo", "-u", TMUX_USER, "tmux", "load-buffer", temp_path],
+            check=True, timeout=10,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+
+        subprocess.run(
+            ["sudo", "-u", TMUX_USER, "tmux", "paste-buffer", "-t", TMUX_TARGET],
+            check=True, timeout=10,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+
+        time.sleep(0.3)
+
+        subprocess.run(
+            ["sudo", "-u", TMUX_USER, "tmux", "send-keys", "-t", TMUX_TARGET, "Enter"],
+            check=True, timeout=10,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+
+        os.unlink(temp_path)
         return True
+    except subprocess.CalledProcessError as e:
+        with open("/tmp/chain-mcp-error.log", "a") as f:
+            f.write(f"{datetime.now()}: CalledProcessError: {e}\n")
+            f.write(f"  TMUX_USER={TMUX_USER} TMUX_TARGET={TMUX_TARGET}\n")
+        return False
     except Exception as e:
         with open("/tmp/chain-mcp-error.log", "a") as f:
-            f.write(f"{datetime.now()}: Exception writing prompt file: {e}\n")
+            f.write(f"{datetime.now()}: Exception: {e}\n")
         return False
 
 
