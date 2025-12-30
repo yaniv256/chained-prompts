@@ -457,5 +457,443 @@ def phase_edit(chain_id: str, phase: str, prompt: str) -> dict:
     }
 
 
+@mcp.tool
+def chain_export(chain_id: str, standalone: bool = False) -> dict:
+    """Export a chain as a standalone MCP server.
+
+    Creates a new MCP server directory with the chain baked in,
+    initializes git, and registers with mcp-manager.
+
+    Args:
+        chain_id: The chain to export (e.g., "character-cycle")
+        standalone: If True, copies tmux logic into exported server.
+                   If False (default), depends on chained-prompts library.
+    """
+    config = load_config()
+
+    if chain_id not in config.get("chains", {}):
+        return {"error": f"Chain '{chain_id}' not found", "available": list(config.get("chains", {}).keys())}
+
+    chain = config["chains"][chain_id]
+    phases = chain.get("phases", [])
+    prompts = chain.get("prompts", {})
+    name = chain.get("name", chain_id)
+    description = chain.get("description", "")
+
+    # Target directory
+    mcp_dir = Path(f"/home/yaniv/agent-flow/mcp-servers/{chain_id}")
+    mcp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate server.py
+    if standalone:
+        server_code = _generate_standalone_server(chain_id, name, description, phases, prompts)
+    else:
+        server_code = _generate_dependent_server(chain_id, name, description, phases, prompts)
+
+    # Write files
+    (mcp_dir / "server.py").write_text(server_code)
+    os.chmod(mcp_dir / "server.py", 0o664)
+
+    # run_server.py wrapper
+    run_server = '''#!/usr/bin/env python3
+"""Clean wrapper for MCP server."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+from server import mcp
+mcp.run(transport="stdio")
+'''
+    (mcp_dir / "run_server.py").write_text(run_server)
+    os.chmod(mcp_dir / "run_server.py", 0o775)
+
+    # requirements.txt
+    (mcp_dir / "requirements.txt").write_text("fastmcp>=0.1.0\n")
+    os.chmod(mcp_dir / "requirements.txt", 0o664)
+
+    # .gitignore
+    gitignore = """.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+"""
+    (mcp_dir / ".gitignore").write_text(gitignore)
+    os.chmod(mcp_dir / ".gitignore", 0o664)
+
+    # Git init or stage changes
+    git_result = _setup_git(mcp_dir, chain_id, name)
+
+    # Create venv if doesn't exist
+    venv_path = mcp_dir / ".venv"
+    if not venv_path.exists():
+        subprocess.run(
+            ["python3", "-m", "venv", str(venv_path)],
+            cwd=mcp_dir,
+            capture_output=True
+        )
+        subprocess.run(
+            [str(venv_path / "bin" / "pip"), "install", "-q", "fastmcp"],
+            cwd=mcp_dir,
+            capture_output=True
+        )
+
+    # Register with mcp-manager
+    reg_result = _register_with_mcp_manager(chain_id, mcp_dir)
+
+    return {
+        "status": "exported",
+        "chain_id": chain_id,
+        "path": str(mcp_dir),
+        "standalone": standalone,
+        "tools": ["start", "complete", "status", "reset"],
+        "git": git_result,
+        "mcp_manager": reg_result,
+        "next": f"Restart Claude Code to load the new '{chain_id}' MCP"
+    }
+
+
+def _generate_standalone_server(chain_id: str, name: str, description: str, phases: list, prompts: dict) -> str:
+    """Generate a fully self-contained server with tmux logic."""
+    phases_str = json.dumps(phases)
+    prompts_str = json.dumps(prompts, indent=4)
+
+    return f'''#!/usr/bin/env python3
+"""{name} MCP - {description}
+
+Exported from chained-prompts. Standalone server with tmux injection.
+
+Tools:
+- start: Begin the chain
+- complete: Mark phase done, auto-advance
+- status: See progress
+- reset: Start fresh
+"""
+import os
+import json
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from fastmcp import FastMCP
+
+mcp = FastMCP("{chain_id}")
+
+# Chain definition (baked in)
+CHAIN_ID = "{chain_id}"
+CHAIN_NAME = "{name}"
+PHASES = {phases_str}
+PROMPTS = {prompts_str}
+
+# State file
+STATE_FILE = Path("/tmp/{chain_id}-state.json")
+
+# tmux configuration
+TMUX_USER = os.environ.get("TMUX_USER", "yaniv")
+TMUX_TARGET = os.environ.get("TMUX_TARGET", "0:zara")
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {{phase: {{"triggered": False, "completed": False}} for phase in PHASES}}
+
+
+def save_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def send_to_tmux(text: str) -> bool:
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(text)
+            temp_path = f.name
+        os.chmod(temp_path, 0o644)
+
+        subprocess.run(
+            ["sudo", "-u", TMUX_USER, "tmux", "load-buffer", temp_path],
+            check=True, timeout=10,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        subprocess.run(
+            ["sudo", "-u", TMUX_USER, "tmux", "paste-buffer", "-t", TMUX_TARGET],
+            check=True, timeout=10,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        time.sleep(0.3)
+        subprocess.run(
+            ["sudo", "-u", TMUX_USER, "tmux", "send-keys", "-t", TMUX_TARGET, "Enter"],
+            check=True, timeout=10,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        os.unlink(temp_path)
+        return True
+    except Exception:
+        return False
+
+
+@mcp.tool
+def start() -> dict:
+    """Begin the {name} chain from the first phase."""
+    first_phase = PHASES[0]
+    prompt = PROMPTS.get(first_phase, f"Phase: {{first_phase}}")
+
+    state = {{phase: {{"triggered": False, "completed": False}} for phase in PHASES}}
+    state[first_phase]["triggered"] = True
+    save_state(state)
+
+    success = send_to_tmux(prompt)
+
+    if success:
+        return {{
+            "status": "started",
+            "phase": first_phase,
+            "next_phase": PHASES[1] if len(PHASES) > 1 else None,
+            "instruction": f"Complete the phase, then call complete(\\"{{first_phase}}\\")"
+        }}
+    return {{"error": "Failed to send to tmux"}}
+
+
+@mcp.tool
+def complete(phase: str, auto_next: bool = True) -> dict:
+    """Mark a phase complete. Auto-triggers next phase by default.
+
+    Args:
+        phase: The phase to complete
+        auto_next: If True (default), automatically trigger the next phase
+    """
+    if phase not in PHASES:
+        return {{"error": f"Phase '{{phase}}' not found", "available": PHASES}}
+
+    state = load_state()
+    state[phase]["completed"] = True
+    save_state(state)
+
+    phase_idx = PHASES.index(phase)
+    next_phase = PHASES[phase_idx + 1] if phase_idx + 1 < len(PHASES) else None
+
+    result = {{"status": "completed", "phase": phase, "next_phase": next_phase}}
+
+    if next_phase and auto_next:
+        prompt = PROMPTS.get(next_phase, f"Phase: {{next_phase}}")
+        state[next_phase]["triggered"] = True
+        save_state(state)
+        result["auto_triggered"] = next_phase
+        result["next_prompt"] = prompt
+        result["instruction"] = f"Execute the prompt above, then call complete(\\"{{next_phase}}\\")"
+    elif not next_phase:
+        result["chain_complete"] = True
+        result["message"] = f"🎉 {{CHAIN_NAME}} complete!"
+        save_state({{phase: {{"triggered": False, "completed": False}} for phase in PHASES}})
+
+    return result
+
+
+@mcp.tool
+def status() -> dict:
+    """See progress of the chain."""
+    state = load_state()
+    completed = sum(1 for p in PHASES if state.get(p, {{}}).get("completed", False))
+
+    current = None
+    next_phase = None
+    for i, phase in enumerate(PHASES):
+        ps = state.get(phase, {{}})
+        if ps.get("triggered") and not ps.get("completed"):
+            current = phase
+            next_phase = PHASES[i + 1] if i + 1 < len(PHASES) else None
+            break
+
+    return {{
+        "chain": CHAIN_NAME,
+        "phases": state,
+        "phase_order": PHASES,
+        "current_phase": current,
+        "next_phase": next_phase,
+        "progress": f"{{completed}}/{{len(PHASES)}}",
+        "complete": completed == len(PHASES)
+    }}
+
+
+@mcp.tool
+def reset() -> dict:
+    """Reset the chain to start fresh."""
+    save_state({{phase: {{"triggered": False, "completed": False}} for phase in PHASES}})
+    return {{"status": "reset", "chain": CHAIN_NAME}}
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+'''
+
+
+def _generate_dependent_server(chain_id: str, name: str, description: str, phases: list, prompts: dict) -> str:
+    """Generate a server that depends on chained-prompts."""
+    phases_str = json.dumps(phases)
+    prompts_str = json.dumps(prompts, indent=4)
+
+    return f'''#!/usr/bin/env python3
+"""{name} MCP - {description}
+
+Exported from chained-prompts. Depends on chained-prompts for execution.
+
+Tools:
+- start: Begin the chain
+- complete: Mark phase done, auto-advance
+- status: See progress
+- reset: Start fresh
+"""
+import sys
+import importlib.util
+
+# Import chained-prompts server explicitly to avoid circular import
+# (local server.py shadows the module name)
+spec = importlib.util.spec_from_file_location(
+    "chained_prompts_server",
+    "/home/yaniv/agent-flow/mcp-servers/chained-prompts/server.py"
+)
+chained_prompts = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(chained_prompts)
+
+chain_start = chained_prompts.chain_start
+chain_complete = chained_prompts.chain_complete
+chain_status = chained_prompts.chain_status
+chain_reset = chained_prompts.chain_reset
+
+from fastmcp import FastMCP
+
+mcp = FastMCP("{chain_id}")
+
+CHAIN_ID = "{chain_id}"
+
+
+@mcp.tool
+def start() -> dict:
+    """Begin the {name} chain from the first phase."""
+    return chain_start(CHAIN_ID)
+
+
+@mcp.tool
+def complete(phase: str, auto_next: bool = True) -> dict:
+    """Mark a phase complete. Auto-triggers next phase by default.
+
+    Args:
+        phase: The phase to complete
+        auto_next: If True (default), automatically trigger the next phase
+    """
+    return chain_complete(CHAIN_ID, phase, auto_next)
+
+
+@mcp.tool
+def status() -> dict:
+    """See progress of the chain."""
+    return chain_status(CHAIN_ID)
+
+
+@mcp.tool
+def reset() -> dict:
+    """Reset the chain to start fresh."""
+    return chain_reset(CHAIN_ID)
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+'''
+
+
+def _setup_git(mcp_dir: Path, chain_id: str, name: str) -> dict:
+    """Initialize or update git repo."""
+    git_dir = mcp_dir / ".git"
+
+    try:
+        if not git_dir.exists():
+            # Initialize new repo
+            subprocess.run(["git", "init"], cwd=mcp_dir, capture_output=True, check=True)
+            subprocess.run(["git", "add", "."], cwd=mcp_dir, capture_output=True, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", f"Initial export of {name} chain"],
+                cwd=mcp_dir, capture_output=True, check=True
+            )
+            return {"action": "initialized", "commit": "initial"}
+        else:
+            # Stage and commit changes
+            subprocess.run(["git", "add", "."], cwd=mcp_dir, capture_output=True, check=True)
+            result = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"],
+                cwd=mcp_dir, capture_output=True
+            )
+            if result.returncode != 0:  # There are staged changes
+                subprocess.run(
+                    ["git", "commit", "-m", f"Update {name} chain export"],
+                    cwd=mcp_dir, capture_output=True, check=True
+                )
+                return {"action": "updated", "commit": "update"}
+            return {"action": "no_changes"}
+    except subprocess.CalledProcessError as e:
+        return {"action": "error", "error": str(e)}
+
+
+def _register_with_mcp_manager(chain_id: str, mcp_dir: Path) -> dict:
+    """Register the new MCP with mcp-manager and auto-load it."""
+    manager_dir = Path("/home/yaniv/agent-flow/mcp-servers/mcp-manager")
+    full_config_path = manager_dir / "full-config.json"
+    project_mcp_path = Path("/home/yaniv/seethegalaxy/team-members/zara-chen/.mcp.json")
+
+    try:
+        # Load full config
+        full_config = json.loads(full_config_path.read_text()) if full_config_path.exists() else {"mcpServers": {}}
+
+        # Add to available servers
+        full_config["mcpServers"][chain_id] = {
+            "command": str(mcp_dir / ".venv" / "bin" / "python"),
+            "args": [str(mcp_dir / "run_server.py")],
+            "env": {
+                "TMUX_USER": "yaniv",
+                "TMUX_TARGET": "0:zara"
+            }
+        }
+        full_config_path.write_text(json.dumps(full_config, indent=2))
+        os.chmod(full_config_path, 0o664)
+
+        # Auto-load: add to project .mcp.json
+        project_config = json.loads(project_mcp_path.read_text()) if project_mcp_path.exists() else {"mcpServers": {}}
+        project_config["mcpServers"][chain_id] = full_config["mcpServers"][chain_id]
+        project_mcp_path.write_text(json.dumps(project_config, indent=2))
+        os.chmod(project_mcp_path, 0o664)
+
+        # Update TOKEN_ESTIMATES in mcp-manager server.py
+        _update_token_estimates(chain_id)
+
+        return {"registered": True, "auto_loaded": True}
+    except Exception as e:
+        return {"registered": False, "error": str(e)}
+
+
+def _update_token_estimates(chain_id: str):
+    """Add token estimate to mcp-manager's TOKEN_ESTIMATES."""
+    manager_server = Path("/home/yaniv/agent-flow/mcp-servers/mcp-manager/server.py")
+    if not manager_server.exists():
+        return
+
+    content = manager_server.read_text()
+
+    # Check if already exists
+    if f'"{chain_id}"' in content:
+        return
+
+    # Find TOKEN_ESTIMATES dict and add entry
+    # Look for the closing brace of TOKEN_ESTIMATES
+    import re
+    pattern = r'(TOKEN_ESTIMATES = \{[^}]+)"chained-prompts": \d+,'
+    match = re.search(pattern, content)
+    if match:
+        # Add new entry after chained-prompts
+        new_entry = f'"{chain_id}": 1200,\n    "chained-prompts"'
+        content = content.replace('"chained-prompts"', new_entry)
+        manager_server.write_text(content)
+        os.chmod(manager_server, 0o664)
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
