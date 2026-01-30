@@ -4,6 +4,13 @@
 A chain is an ordered sequence of phases. Each phase has a prompt that gets
 injected via tmux. Completing a phase auto-triggers the next.
 
+Features:
+- Sequential phase execution with auto-advance
+- Delayed scheduling for deferred execution
+- Local model execution during wait periods ("dreaming")
+- State passing between chain cycles
+- Auto-continue mode for continuous contemplation loops
+
 Tools:
 - chain_list: List all defined chains
 - chain_start: Begin executing a chain
@@ -14,12 +21,18 @@ Tools:
 - chain_delete: Remove a chain
 - chain_get: Get full chain definition
 - phase_edit: Edit a specific phase prompt
+- chain_schedule: Schedule a chain to start after a delay
+- chain_dream: Execute local model task during wait period
+- chain_pass: Pass context/seed to next cycle
+- chain_auto_continue: Enable continuous cycling mode
 """
 import os
 import json
 import subprocess
+import threading
+import time as time_module
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastmcp import FastMCP
 
 mcp = FastMCP("chained-prompts")
@@ -27,10 +40,34 @@ mcp = FastMCP("chained-prompts")
 # Configuration
 CONFIG_FILE = Path("/home/yaniv/agent-flow/mcp-servers/chained-prompts/chains.json")
 STATE_FILE = Path("/tmp/chained-prompts-state.json")
+SCHEDULE_FILE = Path("/tmp/chained-prompts-scheduled.json")
+CONTEXT_FILE = Path("/tmp/chained-prompts-context.json")
 
 # tmux configuration
 TMUX_USER = os.environ.get("TMUX_USER", "yaniv")
-TMUX_TARGET = os.environ.get("TMUX_TARGET", "0:zara")
+TMUX_TARGET_DEFAULT = "0:zara"
+
+
+def _find_tmux_target() -> str:
+    """Dynamically find the tmux session:window with a 'zara' window."""
+    try:
+        result = subprocess.run(
+            ["sudo", "-u", TMUX_USER, "tmux", "list-windows", "-a", "-F",
+             "#{session_name}:#{window_name}"],
+            capture_output=True, text=True, timeout=5,
+            stdin=subprocess.DEVNULL, start_new_session=True
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n"):
+                if line.endswith(":zara"):
+                    return line
+    except Exception:
+        pass
+    return os.environ.get("TMUX_TARGET", TMUX_TARGET_DEFAULT)
+
+
+# Active schedule threads (in-memory, lost on restart)
+_schedule_threads: dict = {}
 
 
 def load_config() -> dict:
@@ -57,6 +94,103 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def load_schedule() -> dict:
+    """Load scheduled chain executions."""
+    if SCHEDULE_FILE.exists():
+        return json.loads(SCHEDULE_FILE.read_text())
+    return {"scheduled": {}, "auto_continue": {}}
+
+
+def save_schedule(schedule: dict):
+    """Save scheduled chain executions."""
+    SCHEDULE_FILE.write_text(json.dumps(schedule, indent=2))
+
+
+def load_context() -> dict:
+    """Load chain context/seed data for passing between cycles."""
+    if CONTEXT_FILE.exists():
+        return json.loads(CONTEXT_FILE.read_text())
+    return {}
+
+
+def save_context(context: dict):
+    """Save chain context/seed data."""
+    CONTEXT_FILE.write_text(json.dumps(context, indent=2))
+
+
+def call_local_model(prompt: str, model: str = "qwen3:4b") -> str:
+    """Call local model via Ollama API. Returns response text."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        data = json.dumps({
+            "model": model,
+            "prompt": prompt,
+            "stream": False
+        }).encode()
+
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=data,
+            headers={"Content-Type": "application/json"}
+        )
+
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            result = json.loads(resp.read().decode())
+            return result.get("response", "")
+    except Exception as e:
+        return f"[local model error: {e}]"
+
+
+def _run_scheduled_chain(chain_id: str, delay_seconds: float, context: dict = None):
+    """Background thread that waits then triggers a chain."""
+    def runner():
+        time_module.sleep(delay_seconds)
+
+        # Check if we were cancelled
+        schedule = load_schedule()
+        if chain_id not in schedule.get("scheduled", {}):
+            return  # Cancelled
+
+        # Remove from scheduled
+        del schedule["scheduled"][chain_id]
+        save_schedule(schedule)
+
+        # Store context if provided
+        if context:
+            ctx = load_context()
+            ctx[chain_id] = context
+            save_context(ctx)
+
+        # Trigger the chain via tmux
+        config = load_config()
+        if chain_id in config.get("chains", {}):
+            chain = config["chains"][chain_id]
+            phases = chain.get("phases", [])
+            if phases:
+                first_phase = phases[0]
+                prompt = chain.get("prompts", {}).get(first_phase, f"Phase: {first_phase}")
+
+                # Inject context if available
+                ctx = load_context().get(chain_id, {})
+                if ctx:
+                    context_str = json.dumps(ctx, indent=2)
+                    prompt = f"[CONTEXT FROM PREVIOUS CYCLE]\n{context_str}\n\n{prompt}"
+
+                # Reset and start
+                state = load_state()
+                state[chain_id] = {phase: {"triggered": False, "completed": False} for phase in phases}
+                state[chain_id][first_phase]["triggered"] = True
+                save_state(state)
+
+                send_to_tmux(prompt)
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    _schedule_threads[chain_id] = thread
+
+
 def get_chain_state(chain_id: str, phases: list) -> dict:
     """Get or initialize state for a specific chain."""
     state = load_state()
@@ -73,6 +207,7 @@ def send_to_tmux(text: str) -> bool:
     """Send text to tmux session using load-buffer for multi-line text."""
     import time
     import tempfile
+    tmux_target = _find_tmux_target()
     try:
         # Write text to temp file, then use tmux load-buffer + paste-buffer
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
@@ -94,7 +229,7 @@ def send_to_tmux(text: str) -> bool:
         )
 
         subprocess.run(
-            ["sudo", "-u", TMUX_USER, "tmux", "paste-buffer", "-t", TMUX_TARGET],
+            ["sudo", "-u", TMUX_USER, "tmux", "paste-buffer", "-t", tmux_target],
             check=True, timeout=10,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -105,7 +240,7 @@ def send_to_tmux(text: str) -> bool:
         time.sleep(0.3)
 
         subprocess.run(
-            ["sudo", "-u", TMUX_USER, "tmux", "send-keys", "-t", TMUX_TARGET, "Enter"],
+            ["sudo", "-u", TMUX_USER, "tmux", "send-keys", "-t", tmux_target, "Enter"],
             check=True, timeout=10,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -118,7 +253,7 @@ def send_to_tmux(text: str) -> bool:
     except subprocess.CalledProcessError as e:
         with open("/tmp/chain-mcp-error.log", "a") as f:
             f.write(f"{datetime.now()}: CalledProcessError: {e}\n")
-            f.write(f"  TMUX_USER={TMUX_USER} TMUX_TARGET={TMUX_TARGET}\n")
+            f.write(f"  TMUX_USER={TMUX_USER} tmux_target={tmux_target}\n")
         return False
     except Exception as e:
         with open("/tmp/chain-mcp-error.log", "a") as f:
@@ -200,7 +335,7 @@ def chain_start(chain_id: str) -> dict:
             "instruction": f"Complete the phase, then call chain_complete(\"{chain_id}\", \"{first_phase}\")"
         }
     else:
-        return {"error": "Failed to send to tmux", "hint": f"Check TMUX_TARGET={TMUX_TARGET}"}
+        return {"error": "Failed to send to tmux", "hint": f"Check tmux target (resolved: {_find_tmux_target()})"}
 
 
 @mcp.tool
@@ -313,6 +448,46 @@ def chain_complete(chain_id: str, phase: str, auto_next: bool = True) -> dict:
         # Reset for next run
         state[chain_id] = {p: {"triggered": False, "completed": False} for p in phases}
         save_state(state)
+
+        # Check for auto-continue mode
+        schedule = load_schedule()
+        auto_config = schedule.get("auto_continue", {}).get(chain_id)
+        if auto_config:
+            delay_minutes = auto_config.get("delay_minutes", 5.0)
+            dream_prompt = auto_config.get("dream_prompt", "")
+
+            # Get current context to pass forward
+            ctx = load_context().get(chain_id, {})
+
+            # Schedule next cycle
+            trigger_time = datetime.now() + timedelta(minutes=delay_minutes)
+            schedule.setdefault("scheduled", {})[chain_id] = {
+                "trigger_at": trigger_time.isoformat(),
+                "delay_minutes": delay_minutes,
+                "context": ctx,
+                "dream_prompt": dream_prompt,
+                "dream_model": "qwen3:4b"
+            }
+            save_schedule(schedule)
+
+            # Start background thread
+            _run_scheduled_chain(chain_id, delay_minutes * 60, ctx)
+
+            result["auto_continue"] = {
+                "scheduled": True,
+                "next_cycle_at": trigger_time.strftime("%H:%M:%S"),
+                "delay_minutes": delay_minutes,
+                "dreaming": bool(dream_prompt)
+            }
+
+            # If dream prompt, run it in background
+            if dream_prompt:
+                def dream_runner():
+                    dream_result = call_local_model(dream_prompt, "qwen3:4b")
+                    c = load_context()
+                    c.setdefault(chain_id, {})["dream_result"] = dream_result
+                    save_context(c)
+                threading.Thread(target=dream_runner, daemon=True).start()
 
     return result
 
@@ -458,6 +633,275 @@ def phase_edit(chain_id: str, phase: str, prompt: str) -> dict:
 
 
 @mcp.tool
+def chain_schedule(
+    chain_id: str,
+    delay_minutes: float,
+    context: str = "",
+    dream_prompt: str = "",
+    dream_model: str = "qwen3:4b"
+) -> dict:
+    """Schedule a chain to start after a delay.
+
+    The execution pointer returns to you now. After the delay, the chain
+    will be triggered via tmux injection.
+
+    Args:
+        chain_id: The chain to schedule
+        delay_minutes: Minutes to wait before triggering
+        context: Optional JSON context to pass to the chain (seed data)
+        dream_prompt: Optional prompt for local model to process during wait
+        dream_model: Model for dream processing (default: qwen3:4b)
+    """
+    config = load_config()
+
+    if chain_id not in config.get("chains", {}):
+        return {"error": f"Chain '{chain_id}' not found"}
+
+    schedule = load_schedule()
+    trigger_time = datetime.now() + timedelta(minutes=delay_minutes)
+
+    # Parse context if provided
+    ctx = {}
+    if context:
+        try:
+            ctx = json.loads(context)
+        except json.JSONDecodeError:
+            ctx = {"raw": context}
+
+    # Store scheduled info
+    schedule.setdefault("scheduled", {})[chain_id] = {
+        "trigger_at": trigger_time.isoformat(),
+        "delay_minutes": delay_minutes,
+        "context": ctx,
+        "dream_prompt": dream_prompt,
+        "dream_model": dream_model
+    }
+    save_schedule(schedule)
+
+    # Start background thread
+    delay_seconds = delay_minutes * 60
+    _run_scheduled_chain(chain_id, delay_seconds, ctx)
+
+    result = {
+        "status": "scheduled",
+        "chain": chain_id,
+        "trigger_at": trigger_time.strftime("%H:%M:%S"),
+        "delay_minutes": delay_minutes
+    }
+
+    # If dream prompt provided, run it now and store result in context
+    if dream_prompt:
+        result["dreaming"] = True
+        result["dream_hint"] = "Local model processing will run in background"
+
+        # Run dream in background thread
+        def dream_runner():
+            dream_result = call_local_model(dream_prompt, dream_model)
+            ctx = load_context()
+            ctx.setdefault(chain_id, {})["dream_result"] = dream_result
+            save_context(ctx)
+
+        threading.Thread(target=dream_runner, daemon=True).start()
+
+    return result
+
+
+@mcp.tool
+def chain_dream(
+    chain_id: str,
+    prompt: str,
+    model: str = "qwen3:4b",
+    store_as: str = "dream"
+) -> dict:
+    """Execute local model task and store result in chain context.
+
+    Use this to have a local model "dream" on a topic while you're busy
+    with other work. The result will be available in the chain's context
+    for the next cycle.
+
+    Args:
+        chain_id: Chain to associate the dream with
+        prompt: Prompt for the local model
+        model: Which model to use (default: qwen3:4b)
+        store_as: Key name to store result under (default: "dream")
+    """
+    config = load_config()
+
+    if chain_id not in config.get("chains", {}):
+        return {"error": f"Chain '{chain_id}' not found"}
+
+    # Call local model synchronously (blocking)
+    result = call_local_model(prompt, model)
+
+    # Store in context
+    ctx = load_context()
+    ctx.setdefault(chain_id, {})[store_as] = result
+    ctx[chain_id][f"{store_as}_timestamp"] = datetime.now().isoformat()
+    save_context(ctx)
+
+    return {
+        "status": "completed",
+        "chain": chain_id,
+        "stored_as": store_as,
+        "result_preview": result[:200] + "..." if len(result) > 200 else result,
+        "model": model
+    }
+
+
+@mcp.tool
+def chain_pass(chain_id: str, context: str, merge: bool = True) -> dict:
+    """Pass context/seed data to the next cycle of a chain.
+
+    The context will be injected at the start of the next chain cycle.
+
+    Args:
+        chain_id: The chain to pass context to
+        context: JSON string with context data
+        merge: If True, merge with existing context. If False, replace.
+    """
+    config = load_config()
+
+    if chain_id not in config.get("chains", {}):
+        return {"error": f"Chain '{chain_id}' not found"}
+
+    try:
+        new_ctx = json.loads(context)
+    except json.JSONDecodeError:
+        new_ctx = {"raw": context}
+
+    ctx = load_context()
+
+    if merge and chain_id in ctx:
+        ctx[chain_id].update(new_ctx)
+    else:
+        ctx[chain_id] = new_ctx
+
+    ctx.setdefault(chain_id, {})["_passed_at"] = datetime.now().isoformat()
+    save_context(ctx)
+
+    return {
+        "status": "passed",
+        "chain": chain_id,
+        "context_keys": list(ctx[chain_id].keys()),
+        "merged": merge
+    }
+
+
+@mcp.tool
+def chain_context(chain_id: str) -> dict:
+    """Get the current context/seed data for a chain.
+
+    Args:
+        chain_id: The chain to get context for
+    """
+    ctx = load_context()
+
+    if chain_id not in ctx:
+        return {"chain": chain_id, "context": None, "message": "No context stored"}
+
+    return {
+        "chain": chain_id,
+        "context": ctx[chain_id]
+    }
+
+
+@mcp.tool
+def chain_auto_continue(
+    chain_id: str,
+    enabled: bool = True,
+    delay_minutes: float = 5.0,
+    dream_prompt: str = ""
+) -> dict:
+    """Enable or disable auto-continue mode for a chain.
+
+    When enabled, completing the final phase will automatically schedule
+    the chain to run again after the specified delay. The execution pointer
+    ping-pongs between you and the local model.
+
+    Args:
+        chain_id: The chain to configure
+        enabled: True to enable auto-continue, False to disable
+        delay_minutes: Minutes between cycles (default: 5)
+        dream_prompt: Optional prompt for local model during wait
+    """
+    config = load_config()
+
+    if chain_id not in config.get("chains", {}):
+        return {"error": f"Chain '{chain_id}' not found"}
+
+    schedule = load_schedule()
+    schedule.setdefault("auto_continue", {})
+
+    if enabled:
+        schedule["auto_continue"][chain_id] = {
+            "delay_minutes": delay_minutes,
+            "dream_prompt": dream_prompt,
+            "enabled_at": datetime.now().isoformat()
+        }
+    else:
+        schedule["auto_continue"].pop(chain_id, None)
+
+    save_schedule(schedule)
+
+    return {
+        "status": "enabled" if enabled else "disabled",
+        "chain": chain_id,
+        "delay_minutes": delay_minutes if enabled else None,
+        "has_dream": bool(dream_prompt) if enabled else False
+    }
+
+
+@mcp.tool
+def chain_scheduled() -> dict:
+    """List all scheduled and auto-continue chains."""
+    schedule = load_schedule()
+    now = datetime.now()
+
+    scheduled = []
+    for chain_id, info in schedule.get("scheduled", {}).items():
+        trigger_at = datetime.fromisoformat(info["trigger_at"])
+        remaining = (trigger_at - now).total_seconds() / 60
+        scheduled.append({
+            "chain": chain_id,
+            "trigger_at": info["trigger_at"],
+            "remaining_minutes": max(0, round(remaining, 1)),
+            "has_dream": bool(info.get("dream_prompt"))
+        })
+
+    auto_continue = []
+    for chain_id, info in schedule.get("auto_continue", {}).items():
+        auto_continue.append({
+            "chain": chain_id,
+            "delay_minutes": info["delay_minutes"],
+            "has_dream": bool(info.get("dream_prompt"))
+        })
+
+    return {
+        "scheduled": scheduled,
+        "auto_continue": auto_continue
+    }
+
+
+@mcp.tool
+def chain_cancel(chain_id: str) -> dict:
+    """Cancel a scheduled chain execution.
+
+    Args:
+        chain_id: The chain to cancel
+    """
+    schedule = load_schedule()
+
+    if chain_id not in schedule.get("scheduled", {}):
+        return {"error": f"Chain '{chain_id}' not scheduled"}
+
+    del schedule["scheduled"][chain_id]
+    save_schedule(schedule)
+
+    # Thread will check and exit when it wakes up
+    return {"status": "cancelled", "chain": chain_id}
+
+
+@mcp.tool
 def chain_export(chain_id: str, standalone: bool = False) -> dict:
     """Export a chain as a standalone MCP server.
 
@@ -588,7 +1032,24 @@ STATE_FILE = Path("/tmp/{chain_id}-state.json")
 
 # tmux configuration
 TMUX_USER = os.environ.get("TMUX_USER", "yaniv")
-TMUX_TARGET = os.environ.get("TMUX_TARGET", "0:zara")
+TMUX_TARGET_DEFAULT = "0:zara"
+
+
+def _find_tmux_target() -> str:
+    try:
+        result = subprocess.run(
+            ["sudo", "-u", TMUX_USER, "tmux", "list-windows", "-a", "-F",
+             "#{{session_name}}:#{{window_name}}"],
+            capture_output=True, text=True, timeout=5,
+            stdin=subprocess.DEVNULL, start_new_session=True
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\\n"):
+                if line.endswith(":zara"):
+                    return line
+    except Exception:
+        pass
+    return os.environ.get("TMUX_TARGET", TMUX_TARGET_DEFAULT)
 
 
 def load_state() -> dict:
@@ -602,6 +1063,7 @@ def save_state(state: dict):
 
 
 def send_to_tmux(text: str) -> bool:
+    tmux_target = _find_tmux_target()
     try:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
             f.write(text)
@@ -615,14 +1077,14 @@ def send_to_tmux(text: str) -> bool:
             start_new_session=True
         )
         subprocess.run(
-            ["sudo", "-u", TMUX_USER, "tmux", "paste-buffer", "-t", TMUX_TARGET],
+            ["sudo", "-u", TMUX_USER, "tmux", "paste-buffer", "-t", tmux_target],
             check=True, timeout=10,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True
         )
         time.sleep(0.3)
         subprocess.run(
-            ["sudo", "-u", TMUX_USER, "tmux", "send-keys", "-t", TMUX_TARGET, "Enter"],
+            ["sudo", "-u", TMUX_USER, "tmux", "send-keys", "-t", tmux_target, "Enter"],
             check=True, timeout=10,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True
@@ -756,10 +1218,11 @@ spec = importlib.util.spec_from_file_location(
 chained_prompts = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(chained_prompts)
 
-chain_start = chained_prompts.chain_start
-chain_complete = chained_prompts.chain_complete
-chain_status = chained_prompts.chain_status
-chain_reset = chained_prompts.chain_reset
+# Extract underlying functions from FunctionTool wrappers
+chain_start = chained_prompts.chain_start.fn
+chain_complete = chained_prompts.chain_complete.fn
+chain_status = chained_prompts.chain_status.fn
+chain_reset = chained_prompts.chain_reset.fn
 
 from fastmcp import FastMCP
 
@@ -849,8 +1312,7 @@ def _register_with_mcp_manager(chain_id: str, mcp_dir: Path) -> dict:
             "command": str(mcp_dir / ".venv" / "bin" / "python"),
             "args": [str(mcp_dir / "run_server.py")],
             "env": {
-                "TMUX_USER": "yaniv",
-                "TMUX_TARGET": "0:zara"
+                "TMUX_USER": "yaniv"
             }
         }
         full_config_path.write_text(json.dumps(full_config, indent=2))

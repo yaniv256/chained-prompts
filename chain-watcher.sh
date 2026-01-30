@@ -6,12 +6,16 @@
 # Default target: 0:zara
 
 PROMPT_FILE="/tmp/chain-prompt-queue.txt"
-TARGET="${1:-0:zara}"
+FIND_SESSION="/home/yaniv/agent-flow/mcp-servers/periodic-prompts/find-session.sh"
 
-echo "Chain watcher started. Watching $PROMPT_FILE for $TARGET"
+echo "Chain watcher started. Watching $PROMPT_FILE (dynamic target via find-session.sh)"
 
 while true; do
     if [ -f "$PROMPT_FILE" ]; then
+        # Resolve target dynamically each time
+        TARGET=$(bash "$FIND_SESSION")
+        echo "$(date): Resolved target: $TARGET"
+
         # Load and inject
         tmux load-buffer "$PROMPT_FILE"
         tmux paste-buffer -t "$TARGET"
