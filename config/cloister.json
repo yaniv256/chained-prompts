@@ -1,0 +1,10 @@
+{
+  "instance": "cloister",
+  "paths": {
+    "chained_prompts": "/home/agent-zara/mcp-servers/chained-prompts",
+    "character_cycle": "/home/agent-zara/mcp-servers/character-cycle",
+    "notebook": "/home/agent-zara/notebook.md",
+    "character": "/home/agent-zara/character.md",
+    "start_here": "/home/agent-zara/START-HERE.md"
+  }
+}

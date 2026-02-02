@@ -1,0 +1,10 @@
+{
+  "instance": "wsl",
+  "paths": {
+    "chained_prompts": "/home/yaniv/agent-flow/mcp-servers/chained-prompts",
+    "character_cycle": "/home/yaniv/agent-flow/mcp-servers/character-cycle",
+    "notebook": "/home/yaniv/seethegalaxy/team-members/zara-chen/notebook.md",
+    "character": "/home/yaniv/seethegalaxy/team-members/zara-chen/character.md",
+    "start_here": "/home/yaniv/seethegalaxy/team-members/zara-chen/START-HERE.md"
+  }
+}
