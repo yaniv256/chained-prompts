@@ -27,21 +27,42 @@ Tools:
 - chain_auto_continue: Enable continuous cycling mode
 """
 import os
+import sys
 import json
 import subprocess
 import threading
 import time as time_module
 from pathlib import Path
 from datetime import datetime, timedelta
-from fastmcp import FastMCP
+
+try:
+    from fastmcp import FastMCP
+except ImportError:  # allow importing tools for unit tests without fastmcp
+    class FastMCP:  # minimal stub: .tool is a no-op decorator
+        def __init__(self, *a, **k):
+            pass
+
+        def tool(self, fn):
+            return fn
+
+        def run(self, *a, **k):
+            raise RuntimeError("fastmcp is not installed; cannot run the server")
+
+# Anchor-slice resolver (lives beside this file). It reads a phase's text from a
+# LIVE skill file so the skill stays the single source of truth (no copies).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from anchor_slice import resolve_anchor_slice, AnchorError
 
 mcp = FastMCP("chained-prompts")
 
-# Configuration
-CONFIG_FILE = Path("/home/yaniv/agent-flow/mcp-servers/chained-prompts/chains.json")
-STATE_FILE = Path("/tmp/chained-prompts-state.json")
-SCHEDULE_FILE = Path("/tmp/chained-prompts-scheduled.json")
-CONTEXT_FILE = Path("/tmp/chained-prompts-context.json")
+# Configuration — storage lives under ~/.chained-prompts (override with
+# CHAINED_PROMPTS_DIR). The chain definitions and per-run progress state live
+# here; nothing is hard-coded to a specific user's home anymore.
+BASE_DIR = Path(os.environ.get("CHAINED_PROMPTS_DIR", "~/.chained-prompts")).expanduser()
+CONFIG_FILE = BASE_DIR / "chains.json"
+STATE_FILE = BASE_DIR / "state.json"
+SCHEDULE_FILE = BASE_DIR / "scheduled.json"
+CONTEXT_FILE = BASE_DIR / "context.json"
 
 # tmux configuration
 TMUX_USER = os.environ.get("TMUX_USER", "yaniv")
@@ -79,6 +100,7 @@ def load_config() -> dict:
 
 def save_config(config: dict):
     """Save chains configuration."""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
 
@@ -91,6 +113,7 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     """Save execution state."""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
@@ -103,6 +126,7 @@ def load_schedule() -> dict:
 
 def save_schedule(schedule: dict):
     """Save scheduled chain executions."""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
     SCHEDULE_FILE.write_text(json.dumps(schedule, indent=2))
 
 
@@ -115,6 +139,7 @@ def load_context() -> dict:
 
 def save_context(context: dict):
     """Save chain context/seed data."""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
     CONTEXT_FILE.write_text(json.dumps(context, indent=2))
 
 
@@ -201,6 +226,46 @@ def get_chain_state(chain_id: str, phases: list) -> dict:
         }
         save_state(state)
     return state[chain_id]
+
+
+def _skill_path_for(chain: dict) -> str:
+    """Resolve the chain's skill_path (relative paths resolve against BASE_DIR)."""
+    raw = chain.get("skill_path", "")
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (BASE_DIR / p)
+    return str(p)
+
+
+def resolve_phase_prompt(chain: dict, phase: str) -> str:
+    """Return a phase's prompt.
+
+    Anchor mode (preferred): the chain has `skill_path` and an `anchors` map of
+    phase -> {"start": <line>, "end": <line-or-null>}; we resolve the slice from
+    the LIVE skill file. Legacy mode: fall back to a literal `prompts[phase]`.
+    Raises AnchorError (fail loud) if anchor mode is configured but unresolvable.
+    """
+    anchors = chain.get("anchors")
+    if anchors and phase in anchors:
+        a = anchors[phase]
+        return resolve_anchor_slice(
+            _skill_path_for(chain), a.get("start"), a.get("end")
+        )
+    legacy = chain.get("prompts", {})
+    if phase in legacy:
+        return legacy[phase]
+    raise AnchorError(
+        f"no prompt for phase {phase!r}: chain has neither an anchor entry "
+        f"nor a legacy prompts[] entry for it"
+    )
+
+
+def _next_uncompleted_phase(phases: list, chain_state: dict):
+    """First phase (in defined order) not yet completed, or None if all done."""
+    for phase in phases:
+        if not chain_state.get(phase, {}).get("completed", False):
+            return phase
+    return None
 
 
 def send_to_tmux(text: str) -> bool:
@@ -297,11 +362,16 @@ def chain_list() -> dict:
 
 
 @mcp.tool
-def chain_start(chain_id: str) -> dict:
+def chain_start(chain_id: str, deliver: str = "return") -> dict:
     """Begin executing a chain from the first phase.
 
+    Delivers the phase prompt as the tool RESULT (deliver="return", default) so
+    it works in any MCP client with no tmux. deliver="tmux" restores the legacy
+    injection path for a tmux-wrapped session.
+
     Args:
-        chain_id: The chain to start (e.g., "character-cycle")
+        chain_id: The chain to start (e.g., "incident-investigation")
+        deliver: "return" (default) to get the prompt in this result, or "tmux".
     """
     config = load_config()
 
@@ -315,7 +385,10 @@ def chain_start(chain_id: str) -> dict:
         return {"error": "Chain has no phases defined"}
 
     first_phase = phases[0]
-    prompt = chain.get("prompts", {}).get(first_phase, f"Phase: {first_phase}")
+    try:
+        prompt = resolve_phase_prompt(chain, first_phase)
+    except AnchorError as e:
+        return {"error": f"anchor_resolution_failed: {e}", "chain": chain_id, "phase": first_phase}
 
     # Reset and start
     state = load_state()
@@ -323,19 +396,24 @@ def chain_start(chain_id: str) -> dict:
     state[chain_id][first_phase]["triggered"] = True
     save_state(state)
 
-    # Send prompt
-    success = send_to_tmux(prompt)
+    result = {
+        "status": "started",
+        "chain": chain_id,
+        "phase": first_phase,
+        "phase_index": 1,
+        "total": len(phases),
+        "next_action": f"Do this phase, then call chain_complete(\"{chain_id}\", \"{first_phase}\") to get the next phase.",
+    }
 
-    if success:
-        return {
-            "status": "started",
-            "chain": chain_id,
-            "phase": first_phase,
-            "next_phase": phases[1] if len(phases) > 1 else None,
-            "instruction": f"Complete the phase, then call chain_complete(\"{chain_id}\", \"{first_phase}\")"
-        }
+    if deliver == "tmux":
+        if not send_to_tmux(prompt):
+            return {"error": "Failed to send to tmux", "hint": f"Check tmux target (resolved: {_find_tmux_target()})"}
+        result["delivered"] = "tmux"
     else:
-        return {"error": "Failed to send to tmux", "hint": f"Check tmux target (resolved: {_find_tmux_target()})"}
+        result["prompt"] = prompt
+        result["delivered"] = "return"
+
+    return result
 
 
 @mcp.tool
@@ -415,32 +493,53 @@ def chain_complete(chain_id: str, phase: str, auto_next: bool = True) -> dict:
     if chain_id not in state:
         state[chain_id] = {p: {"triggered": False, "completed": False} for p in phases}
 
+    # ANTI-SKIP (the whole point): you may only complete the current expected
+    # phase — the first not-yet-completed phase in defined order. Completing a
+    # later phase to jump ahead is rejected; re-completing the current phase is
+    # idempotent. This makes phase-skipping impossible by construction.
+    expected = _next_uncompleted_phase(phases, state[chain_id])
+    if expected is None:
+        return {"status": "already_complete", "chain": chain_id,
+                "message": f"{chain.get('name', chain_id)} already complete."}
+    if phase != expected:
+        return {
+            "error": "out_of_order",
+            "chain": chain_id,
+            "expected_phase": expected,
+            "got_phase": phase,
+            "message": f"Cannot complete '{phase}' yet — the next phase to complete is "
+                       f"'{expected}'. Phases run in order; you cannot skip ahead.",
+        }
+
     state[chain_id][phase]["completed"] = True
     save_state(state)
 
-    # Find next phase
-    phase_idx = phases.index(phase)
-    next_phase = phases[phase_idx + 1] if phase_idx + 1 < len(phases) else None
+    # Next phase = the next uncompleted phase in defined order (now that `phase`
+    # is marked done).
+    next_phase = _next_uncompleted_phase(phases, state[chain_id])
 
     result = {
         "status": "completed",
         "chain": chain_id,
         "phase": phase,
-        "next_phase": next_phase
+        "next_phase": next_phase,
     }
 
     if next_phase and auto_next:
-        prompt = chain.get("prompts", {}).get(next_phase, f"Phase: {next_phase}")
+        try:
+            prompt = resolve_phase_prompt(chain, next_phase)
+        except AnchorError as e:
+            return {"error": f"anchor_resolution_failed: {e}", "chain": chain_id, "phase": next_phase}
 
         # Mark as triggered
         state[chain_id][next_phase]["triggered"] = True
         save_state(state)
 
-        # Return the prompt directly - no tmux needed
-        # The agent executing the chain will receive this and act on it
+        # Return the next phase's prompt directly — the agent reads it from this
+        # tool result and flows straight into the next phase. No tmux needed.
         result["auto_triggered"] = next_phase
         result["next_prompt"] = prompt
-        result["instruction"] = f"Execute the prompt above, then call chain_complete(\"{chain_id}\", \"{next_phase}\")"
+        result["instruction"] = f"Do the phase above, then call chain_complete(\"{chain_id}\", \"{next_phase}\")"
 
     elif not next_phase:
         result["chain_complete"] = True
@@ -519,39 +618,72 @@ def chain_define(
     chain_id: str,
     name: str,
     phases: list,
-    prompts: dict,
-    description: str = ""
+    prompts: dict = None,
+    description: str = "",
+    skill_path: str = "",
+    anchors: dict = None,
 ) -> dict:
     """Create or update a chain definition.
 
+    Two ways to supply phase content:
+    - ANCHOR MODE (preferred): pass `skill_path` (a phased skill file) and
+      `anchors` — a dict mapping each phase name to {"start": <verbatim line>,
+      "end": <verbatim line or null for EOF>}. Phase prompts are resolved from
+      the LIVE skill at run time, so the skill stays the single source of truth
+      and nothing needs syncing. Anchors are usually the phase headings.
+    - LEGACY MODE: pass `prompts` — a dict mapping phase names to literal text.
+
     Args:
-        chain_id: Unique identifier (e.g., "emotional-restore")
+        chain_id: Unique identifier (e.g., "incident-investigation")
         name: Display name
-        phases: Ordered list of phase names (e.g., ["survey", "cluster", "peak"])
-        prompts: Dict mapping phase names to prompt text
+        phases: Ordered list of phase names (defines run order)
+        prompts: Legacy — dict of phase -> literal prompt text
         description: Brief description of the chain's purpose
+        skill_path: Anchor mode — path to the phased skill file
+        anchors: Anchor mode — dict of phase -> {"start": line, "end": line|null}
     """
+    prompts = prompts or {}
+    anchors = anchors or {}
     config = load_config()
 
-    # Validate phases have prompts
-    missing = [p for p in phases if p not in prompts]
-    if missing:
-        return {"error": f"Missing prompts for phases: {missing}"}
+    if anchors:
+        if not skill_path:
+            return {"error": "anchor mode requires skill_path"}
+        missing = [p for p in phases if p not in anchors]
+        if missing:
+            return {"error": f"Missing anchors for phases: {missing}"}
+        for p, a in anchors.items():
+            if not isinstance(a, dict) or "start" not in a:
+                return {"error": f"anchor for phase '{p}' needs at least a 'start' line"}
+        entry = {
+            "name": name,
+            "description": description,
+            "phases": phases,
+            "skill_path": skill_path,
+            "anchors": anchors,
+        }
+    else:
+        # Legacy mode — validate every phase has a literal prompt
+        missing = [p for p in phases if p not in prompts]
+        if missing:
+            return {"error": f"Missing prompts for phases: {missing} "
+                             f"(or supply skill_path + anchors for anchor mode)"}
+        entry = {
+            "name": name,
+            "description": description,
+            "phases": phases,
+            "prompts": prompts,
+        }
 
-    config.setdefault("chains", {})[chain_id] = {
-        "name": name,
-        "description": description,
-        "phases": phases,
-        "prompts": prompts
-    }
-
+    config.setdefault("chains", {})[chain_id] = entry
     save_config(config)
 
     return {
         "status": "defined",
         "chain_id": chain_id,
         "phases": phases,
-        "phase_count": len(phases)
+        "phase_count": len(phases),
+        "mode": "anchor" if anchors else "legacy",
     }
 
 
@@ -592,13 +724,19 @@ def chain_get(chain_id: str) -> dict:
         return {"error": f"Chain '{chain_id}' not found", "available": list(config.get("chains", {}).keys())}
 
     chain = config["chains"][chain_id]
-    return {
+    out = {
         "id": chain_id,
         "name": chain.get("name"),
         "description": chain.get("description"),
         "phases": chain.get("phases"),
-        "prompts": chain.get("prompts")
+        "mode": "anchor" if chain.get("anchors") else "legacy",
     }
+    if chain.get("anchors"):
+        out["skill_path"] = chain.get("skill_path")
+        out["anchors"] = chain.get("anchors")
+    else:
+        out["prompts"] = chain.get("prompts")
+    return out
 
 
 @mcp.tool
