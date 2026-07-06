@@ -6,6 +6,37 @@ A chain is like a protocol or ritual: a series of prompts that execute in order,
 
 ---
 
+## Skill-as-Chained-Prompt (anchor mode)
+
+The primary use: run an existing **phased skill** as a chain so it can't be
+skipped or run from memory. A chain phase stores only **anchors** into the LIVE
+skill file — `{skill_path, anchors: {phase: {start, end}}}` — never a copy. At
+run time the MCP re-reads the skill and serves the slice, so the skill stays the
+single source of truth (edit it → reflected next run, zero sync).
+
+- **Delivery is tool-return:** `chain_start` / `chain_complete` return the phase
+  prompt in their result (`deliver="return"`, the default). Works in any MCP
+  client, no tmux. `deliver="tmux"` restores the legacy injection path.
+- **Skipping is impossible:** `chain_complete` only ever serves the next
+  uncompleted phase in order; completing a later phase returns `out_of_order`.
+- **Convert a skill** with the `skill-to-chained-prompt` skill (`skills/`): it
+  picks anchors and adds a self-redirect line to the target skill.
+- **Storage** lives under `~/.chained-prompts/` (override `CHAINED_PROMPTS_DIR`).
+
+Register the MCP (Claude Code, `~/.claude.json`):
+
+```json
+"chained-prompts": {
+  "command": "python3",
+  "args": ["<path>/chained-prompts/run_server.py"],
+  "env": { "CHAINED_PROMPTS_DIR": "~/.chained-prompts" }
+}
+```
+
+Requires `fastmcp` (`pip install fastmcp`) and a session restart to load.
+
+---
+
 ## Core Concepts
 
 ### Chain
