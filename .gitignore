@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime storage (lives in ~/.chained-prompts by default; never commit a
+# user's own chains/state/context). chains.example.json is the shipped seed.
+chains.json
+state.json
+context.json

@@ -1,0 +1,63 @@
+{
+  "chains": {
+    "incident-investigation": {
+      "name": "Incident Investigation",
+      "description": "10-phase hypothesis-driven debugging: evidence, experiment, three-level blame, anti-pattern search, remediation. Served one phase at a time; no phase can be skipped.",
+      "phases": [
+        "phase1",
+        "phase2",
+        "phase3",
+        "phase4",
+        "phase5",
+        "phase6",
+        "phase7",
+        "phase8",
+        "phase9",
+        "phase10"
+      ],
+      "skill_path": "~/.claude/skills/incident-investigation/SKILL.md",
+      "anchors": {
+        "phase1": {
+          "start": "### Phase 1: Open Investigation",
+          "end": "### Phase 2: Initial Hypotheses"
+        },
+        "phase2": {
+          "start": "### Phase 2: Initial Hypotheses",
+          "end": "### Phase 3: Evidence Collection (Non-Destructive)"
+        },
+        "phase3": {
+          "start": "### Phase 3: Evidence Collection (Non-Destructive)",
+          "end": "### Phase 4: Revised Hypotheses (Post-Evidence)"
+        },
+        "phase4": {
+          "start": "### Phase 4: Revised Hypotheses (Post-Evidence)",
+          "end": "### Phase 5: Experimentation"
+        },
+        "phase5": {
+          "start": "### Phase 5: Experimentation",
+          "end": "### Phase 6: Final Hypothesis Revision"
+        },
+        "phase6": {
+          "start": "### Phase 6: Final Hypothesis Revision",
+          "end": "### Phase 7: Blame Assignment (Three Levels)"
+        },
+        "phase7": {
+          "start": "### Phase 7: Blame Assignment (Three Levels)",
+          "end": "### Phase 8: Immediate Fix"
+        },
+        "phase8": {
+          "start": "### Phase 8: Immediate Fix",
+          "end": "### Phase 9: Anti-Pattern Search"
+        },
+        "phase9": {
+          "start": "### Phase 9: Anti-Pattern Search",
+          "end": "### Phase 10: Comprehensive Remediation Plan"
+        },
+        "phase10": {
+          "start": "### Phase 10: Comprehensive Remediation Plan",
+          "end": "## Additional Resources"
+        }
+      }
+    }
+  }
+}
