@@ -500,6 +500,19 @@ def chain_define(
         for p, a in anchors.items():
             if not isinstance(a, dict) or "start" not in a:
                 return {"error": f"anchor for phase '{p}' needs at least a 'start' line"}
+        # Validate every phase boundary before persisting the definition. A bad
+        # late-phase anchor otherwise remains latent until the chain reaches it,
+        # potentially after hours of completed work.
+        for p in phases:
+            a = anchors[p]
+            try:
+                resolve_anchor_slice(skill_path, a["start"], a.get("end"))
+            except AnchorError as exc:
+                return {
+                    "error": "anchor_validation_failed",
+                    "phase": p,
+                    "message": str(exc),
+                }
         entry = {
             "name": name,
             "description": description,
