@@ -119,13 +119,32 @@ def test_recomplete_current_is_idempotent(srv):
 
 
 def test_fail_loud_on_bad_anchor(srv):
-    srv.chain_define(
+    r = srv.chain_define(
         "inc", "Incident", ["p1"],
         skill_path=srv._skill,
         anchors={"p1": {"start": "### Phase 9: Nope", "end": None}},
     )
-    r = srv.chain_start("inc")
-    assert "error" in r and "anchor_resolution_failed" in r["error"]
+    assert r["error"] == "anchor_validation_failed"
+    assert r["phase"] == "p1"
+    assert "start anchor not found" in r["message"]
+    assert "inc" not in srv.load_config().get("chains", {})
+
+
+def test_define_rejects_multiline_anchor_before_persisting(srv):
+    r = srv.chain_define(
+        "inc", "Incident", ["p1"],
+        skill_path=srv._skill,
+        anchors={
+            "p1": {
+                "start": "### Phase 1: Open",
+                "end": "---\n\n### Phase 2: Hypotheses",
+            }
+        },
+    )
+    assert r["error"] == "anchor_validation_failed"
+    assert r["phase"] == "p1"
+    assert "end anchor not found" in r["message"]
+    assert "inc" not in srv.load_config().get("chains", {})
 
 
 # --- anti-idle self-wake reminder ---
